@@ -19,7 +19,8 @@ web_image = modal.Image.debian_slim(python_version="3.12").pip_install(
 )
 
 MODAL_URL = "https://vesanit--main-endpoint.modal.run"
-MODAL_TOKEN = "<your-modal-token>"
+MODAL_TOKEN = "<your-modal-token>"  # Replace or use os.getenv("MODAL_TOKEN")
+
 
 def process_input(config_type, conda_choice, gpu_choice, python_version, state=None):
     if state is None:
@@ -36,8 +37,9 @@ def process_input(config_type, conda_choice, gpu_choice, python_version, state=N
         "version_preference": "latest" if config_type == "Latest Packages" else "stable",
         "python_version": python_version
     }
-    logger.info(f"Processed input: {state['user_input']}")
+    logger.info(f"Processed input: {json.dumps(state['user_input'])}")
     return "Got it, please enter your request below.", state
+
 
 def handle_query(query, state=None):
     if state is None:
@@ -52,25 +54,52 @@ def handle_query(query, state=None):
     user_input = state.get("user_input", {})
     user_input["query"] = query
     state["user_input"] = user_input
-    logger.info(f"Sending to Modal: {user_input}")
+
+    start_time = time.time()
+    logger.info(f"Sending to Modal: {json.dumps(user_input)}")
 
     try:
-        response = requests.post(
-            MODAL_URL,
-            json=user_input,
-            headers={"Authorization": f"Bearer {MODAL_TOKEN}", "Content-Type": "application/json"},
-            timeout=1800
-        )
-        response.raise_for_status()
-        result = response.json()
-        logger.info(f"Received Modal result: {result}")
-        if "error" in result:
-            return f"Error: {result['error']}", state
-        formatted_result = json.dumps(json.loads(result["result"]), indent=2)
-        return f"Environment setup complete!\n\n```json\n{formatted_result}\n```", state
+        headers = {
+            "Authorization": f"Bearer {MODAL_TOKEN}",
+            "Content-Type": "application/json",
+            "Connection": "keep-alive"
+        }
+        with requests.post(
+                MODAL_URL,
+                json=user_input,
+                headers=headers,
+                timeout=7200,  # 2 hours
+                stream=True  # Enable streaming
+        ) as response:
+            response.raise_for_status()
+            output = "Relax, have some tea, we're doing our thing"
+            for line in response.iter_lines():
+                if line:
+                    data = json.loads(line.decode('utf-8'))
+                    if data.get("status") == "working":
+                        output = "Relax, have some tea, we're doing our thing"
+                        yield output, state  # Yield to update gr.Textbox
+                    elif data.get("status") == "done":
+                        result_data = json.loads(data["result"])
+                        message = result_data.get("message", "Error: No message provided in response.")
+                        elapsed_time = time.time() - start_time
+                        logger.info(f"Query completed in {elapsed_time:.2f} seconds")
+                        yield message, state  # Final result
+                        break
+
+    except requests.Timeout as e:
+        elapsed_time = time.time() - start_time
+        logger.error(f"Request timed out after {elapsed_time:.2f} seconds: {str(e)}")
+        return f"Error: Request timed out after {elapsed_time:.2f} seconds.", state
     except requests.RequestException as e:
-        logger.error(f"Modal call failed: {str(e)}")
+        elapsed_time = time.time() - start_time
+        logger.error(f"Modal call failed after {elapsed_time:.2f} seconds: {str(e)}")
         return f"Error: Failed to call Modal: {str(e)}", state
+    except json.JSONDecodeError as e:
+        elapsed_time = time.time() - start_time
+        logger.error(f"Failed to parse Modal response after {elapsed_time:.2f} seconds: {str(e)}")
+        return f"Error: Invalid response from server: {str(e)}", state
+
 
 def create_gradio_interface():
     theme = gr.themes.Base(
@@ -153,18 +182,21 @@ def create_gradio_interface():
         query_submit.click(
             fn=handle_query,
             inputs=[query_input, state],
-            outputs=[query_output, state]
+            outputs=[query_output, state],
+            queue=True,
+            concurrency_limit=1  # Limit concurrency for streaming
         )
 
-        demo.queue(max_size=5)
+        demo.queue(max_size=10)
     return demo
+
 
 @app.function(
     image=web_image,
     min_containers=1,
-    scaledown_window=60 * 30,
-    max_containers=1,
-    timeout=3600,
+    scaledown_window=60 * 60,
+    max_containers=2,
+    timeout=7200
 )
 @modal.concurrent(max_inputs=100)
 @modal.asgi_app()
