@@ -12,7 +12,9 @@ import uuid
 import fcntl
 import re
 from select import select
-
+from fastapi.responses import StreamingResponse
+import asyncio
+from anthropic import Anthropic, APIError
 
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="langchain")
 
@@ -113,7 +115,11 @@ The response must be valid JSON without any surrounding text.
 - Thought: 
   1. If "use_conda": True, use Micromamba at /volume/micromamba/micromamba. Analyze logs for errors (e.g., version conflicts, unavailable packages, test failures, or missing pip). Always include 'pip' in the package list to ensure it is available for subsequent pip installations and test scripts. Reason through dependencies to resolve compatible versions across conda-forge and defaults channels. Create an environment with `micromamba create -y -n env python={{python_version}} pip`. For version conflicts, select compatible versions by adjusting package versions or using pip fallback if necessary. Install packages via Micromamba with -c conda-forge -c defaults --no-channel-priority. For unsupported packages, use /volume/micromamba/micromamba run -n env pip install --no-cache-dir <pip_packages>. If use_gpu=True, append --extra-index-url https://download.pytorch.org/whl/cu{{cuda_version_no_dots}} to pip install. If flexible channel priority fails, try reordering channels or excluding problematic packages as a last resort. If "version_preference": "stable", prefer stable packages; if "latest", prefer latest compatible packages. Generate test_script to verify all packages and include GPU checks if relevant.
   2. If "use_conda": False, use pip in a virtual environment. Analyze logs for errors (e.g., version conflicts, unavailable packages, test failures, or pip issues). Select stable and compatible package versions by reasoning through dependencies. Ensure pip is upgraded after venv creation. Include --extra-index-url https://download.pytorch.org/whl/cu{{cuda_version_no_dots}} only if use_gpu=True and GPU packages are required. Do not install drivers. Generate test_script to verify all packages and include GPU checks if relevant.
-- Action: If errors detected, generate updated bash_commands and test_script to resolve issues, maintaining as many packages as possible. 
+3. Analyze test logs (including pip check output) for hidden compatibility issues not caught in Cycle 2 (e.g., version conflicts or dependency mismatches). If issues are found, set {"status": "error"} and propose updated bash_commands and test_script. If no issues, retain the original bash_commands and test_script from Cycle 2, implying success for transition to Cycle 4.
+- Action: 
+  If errors detected (e.g., version conflicts, test failures), return {"response_type": "json", "status": "error", "bash_commands": "...", "test_script": "...", "reasoning_content": "<p>...</p>", "message": "..."} with updated commands and a rationale for changes. 
+  If no errors, return {"response_type": "json", "bash_commands": "...", "test_script": "...", "reasoning_content": "<p>...</p>", "message": "..."} using Cycle 2 commands, excluding 'export DEBIAN_FRONTEND=noninteractive', and note in reasoning_content that compatibility is confirmed.
+  Replace {{python_version}} with the user-specified python_version (e.g., 3.12), {{python_version_no_dots}} with Python version without dots (e.g., 312), and {{cuda_version_no_dots}} with CUDA version without dots (e.g., 124 for 12.4).
   For use_conda=True: use 
     mkdir -p /volume/workdir\n
     cd /volume/workdir\n
@@ -140,41 +146,51 @@ The response must be valid JSON without any surrounding text.
 **Cycle 4: Generate Clean User-Facing Installation Commands**
 - Observation: Receive the final JSON response from Cycle 2 or Cycle 3 (bash_commands, test_script, reasoning_content, message), the original User input JSON (query, use_conda, use_gpu, version_preference, python_version), and test results from Cycle 2/3 containing 'status' ('success' or 'error'), 'output', and 'error'.
 - Thought: 
-  1. Generate clean, user-friendly bash commands for installing the environment on the user's machine. Remove all internal paths (e.g., /volume, /volume/micromamba) and Modal-specific details. Assume the user has conda installed if use_conda=True, or Python installed if use_conda=False.
-     - If use_conda=True, use `conda` commands (e.g., `conda create`, `conda install`, `conda activate`) and assume conda is already installed. Do NOT include commands to install Micromamba or any other package manager. Use the same channels (e.g., conda-forge, defaults) and package versions as in Cycle 2/3.
-     - If use_conda=False, provide commands for a virtual environment using `python -m venv` and `pip install`, with activation steps (e.g., `source env/bin/activate`).
-     - If use_gpu=True, include GPU-specific packages (e.g., `pytorch` with `--extra-index-url https://download.pytorch.org/whl/cu121`) only if they are allowed by Cycle 2/3, and note in comments that CUDA drivers must be installed manually.
+  - Thought: 
+  1. Preserve the bash_commands from Cycle 2 or Cycle 3 as-is for internal use (e.g., may include Modal-specific paths or additional setup steps).
+  2. Generate clean, user-friendly bash commands for the 'message' field, formatted for direct use on the user's machine. These commands must:
+     - Remove all internal paths (e.g., /volume, /volume/micromamba) and Modal-specific details.
+     - Assume the user has conda installed if use_conda=True, or Python installed if use_conda=False.
+     - If use_conda=True, use `conda` commands (e.g., `conda create`, `conda install`, `conda activate`). Do NOT include commands to install Micromamba or other package managers. Use the same channels (e.g., conda-forge, defaults) and package versions as in Cycle 2/3.
+     - If use_conda=False, use `python -m venv` for a virtual environment, followed by `pip install` and activation steps (e.g., `source env/bin/activate`).
+     - If use_gpu=True, include GPU-specific packages (e.g., `pytorch` with `--extra-index-url https://download.pytorch.org/whl/cu121`) only if allowed by Cycle 2/3. Note in comments that CUDA drivers must be installed manually.
      - If any packages were installed via pip instead of conda, explain in comments why (e.g., not available in conda channels).
-     - Ensure commands include environment activation steps (e.g., `conda activate env` or `source env/bin/activate`).
-     - If test_result['status'] == 'success', confirm the environment is fully functional. If test_result['status'] == 'error', use the bash_commands from Cycle 2/3 as a fallback, but warn in comments that the environment could not be fully tested due to test failures, which may stem from incorrect test scripts or unresolved dependencies. Suggest trying the proposed configuration.
-  2. Include comments as <p>...</p> explaining:
+     - Include environment activation steps (e.g., `conda activate env` or `source env/bin/activate`).
+     - Format commands with comments (e.g., `# Create and activate environment`) as shown in the examples below, and place them in the 'message' field.
+     - If test_result['status'] == 'success', confirm the environment is functional. If test_result['status'] == 'error', use the bash_commands from Cycle 2/3 as a fallback for 'bash_commands', but generate 'message' with proposed commands, warning in comments about test failures.
+    3. Include comments as <p>...</p> explaining:
      - The purpose of the commands and the environment setup.
      - Any package modifications (e.g., downgrades, exclusions, pip installations) with reasons (e.g., version conflicts, channel unavailability).
      - Additional user instructions (e.g., manual installation of NVIDIA drivers for GPU support).
      - Differences between user-requested packages and the final set, if any.
-     - If test_result['status'] == 'error', include: "We could not fully test the environment due to test failures, which may be caused by incorrect test scripts or unresolved dependencies. However, we propose trying the following configuration."
-  3. Set message to confirm success or warn about limitations:
-     - If test_result['status'] == 'success', message should confirm: "Environment setup and tests successful."
-     - If test_result['status'] == 'error', message should state: "Environment could not be fully tested due to test failures. Please try the proposed configuration and report any issues."
-- Action: Generate bash_commands for the user to run on their system. Replace {{python_version}} with the user-specified python_version (e.g., 3.12), {{python_version_no_dots}} with Python version without dots (e.g., 312), and {{cuda_version_no_dots}} with CUDA version without dots (e.g., 121 for 12.1). 
-For example:
-  For use_conda=True:
-  # Create and activate environment
-  conda create -y -n webdev_env python=3.12 pip -c conda-forge --no-channel-priority
-  conda activate webdev_env
-  # Install packages
-  conda install -y requests=2.32.3 flask=3.0.3 fastapi=0.115.0 httpx=0.27.2 pydantic=2.9.2 click=8.1.7 rich=13.8.1 typer=0.12.5 -c conda-forge -c defaults --no-channel-priority
-  # Verify installation
-  echo "Environment setup complete! Activate with: conda activate webdev_env"
-  
-  For use_conda=False:
-    # Create and activate virtual environment
-    python -m venv webdev_env
-    source webdev_env/bin/activate
+     - If test_result['status'] == 'error', include: "We could not fully test the environment due to test failures, which may be caused by incorrect test scripts or unresolved dependencies. However, we propose trying the following configuration in 'message'."
+  4. Set a status message (not to be confused with the 'message' field) to confirm success or warn about limitations, included in 'comments':
+     - If test_result['status'] == 'success', include in comments: "Environment setup and tests successful."
+     - If test_result['status'] == 'error', include in comments: "Environment could not be fully tested due to test failures. Please try the proposed configuration in 'message' and report any issues."
+- Action: 
+  1. Use bash_commands from Cycle 2 or Cycle 3 for the 'bash_commands' field without modification.
+  2. Generate user-friendly commands for the 'message' field, formatted as in the examples below, replacing {{python_version}} with the user-specified python_version (e.g., 3.12), {{python_version_no_dots}} with Python version without dots (e.g., 312), and {{cuda_version_no_dots}} with CUDA version without dots (e.g., 121 for 12.1).
+  3. Ensure 'message' contains commands in the exact format of the examples, including comments (e.g., `# Create and activate environment`).
+  For example:
+    For use_conda=True:
+    
+    # Create and activate environment
+    conda create -y -n webdev_env python=3.12 pip -c conda-forge --no-channel-priority
+    conda activate webdev_env
+    
     # Install packages
-    pip install requests==2.32.3 flask=3.0.3 fastapi=0.115.0 httpx=0.27.2 pydantic=2.9.2 click=8.1.7 rich=13.8.1 typer=0.12.5
-    # Verify installation
-    echo "Environment setup complete! Activate with: source webdev_env/bin/activate"
+    conda install -y requests=2.32.3 flask=3.0.3 fastapi=0.115.0 httpx=0.27.2 pydantic=2.9.2 click=8.1.7 rich=13.8.1 typer=0.12.5 -c conda-forge -c defaults --no-channel-priority
+    
+    Environment setup complete!
+    For use_conda=False:
+      # Create and activate virtual environment
+      python -m venv webdev_env
+      source webdev_env/bin/activate
+      
+      # Install packages
+      pip install requests==2.32.3 flask=3.0.3 fastapi=0.115.0 httpx=0.27.2 pydantic=2.9.2 click=8.1.7 rich=13.8.1 typer=0.12.5
+      
+      Environment setup complete!
 """
 
 def extract_json(raw_response: str) -> dict:
@@ -198,480 +214,7 @@ def extract_json(raw_response: str) -> dict:
 
 logger = logging.getLogger(__name__)
 
-@app.function(
-    image=image_311,
-    gpu="A10",
-    volumes={"/volume": modal.Volume.from_name("claude-test-cache")},
-    timeout=1200,
-    secrets=[modal.Secret.from_name("anthropic-secret")],
-    max_containers=1
-)
-def run_test_311(commands: list, test_script: str, use_conda: bool = False):
-    run_id = uuid.uuid4().hex[:8]
-    logger.info(f"Running test [Run ID: {run_id}] with commands: {commands}, use_conda: {use_conda}")
-    setup_log_path = "/volume/setup_log.txt"
-    test_log_path = "/volume/test_log.txt"
-    app_log_path = "/volume/app_log.txt"
-    result_path = "/volume/result.json"
-    cache_dir = None
-    lock_file = "/volume/micromamba/lockfile"
-
-    try:
-        if use_conda:
-            os.makedirs(os.path.dirname(lock_file), exist_ok=True)
-            with open(lock_file, "w") as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                logger.info(f"Acquired lock [Run ID: {run_id}]")
-
-        if use_conda:
-            cache_dir = f"/volume/micromamba/cache_{run_id}"
-            os.makedirs(cache_dir, exist_ok=True)
-            os.environ["MAMBA_ROOT_PREFIX"] = "/volume/micromamba"
-            os.environ["MAMBA_CACHE_DIR"] = cache_dir
-            logger.info(f"MAMBA_ROOT_PREFIX=/volume/micromamba, MAMBA_CACHE_DIR={cache_dir}")
-
-            micromamba_check = subprocess.run(
-                ["/volume/micromamba/micromamba", "--version"],
-                capture_output=True,
-                text=True
-            )
-            logger.info(f"Micromamba version: {micromamba_check.stdout.strip()}")
-
-        for log_file in [setup_log_path, test_log_path, app_log_path, result_path]:
-            os.makedirs(os.path.dirname(log_file), exist_ok=True)
-            if not os.path.exists(log_file):
-                with open(log_file, "w") as f:
-                    f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Log file created\n")
-                logger.info(f"Created log file: {log_file}")
-
-        logger.info("Writing setup script to /volume/setup.sh")
-        with open("/volume/setup.sh", "w") as f:
-            f.write("#!/bin/bash\nset -e\n")
-            if use_conda:
-                f.write("export MAMBA_ROOT_PREFIX=/volume/micromamba\n")
-                f.write(f"export MAMBA_CACHE_DIR={cache_dir}\n")
-            f.write("\n".join(commands) + "\n")
-        os.chmod("/volume/setup.sh", 0o755)
-
-        logger.info("Executing setup script /volume/setup.sh")
-        start_time = time.time()
-        with open(setup_log_path, "a") as setup_log:
-            setup_log.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Executing setup:\n")
-            process = subprocess.Popen(
-                ["/volume/setup.sh"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-            )
-            stdout_lines, stderr_lines = [], []
-            while process.poll() is None:
-                readable, _, _ = select([process.stdout, process.stderr], [], [], 1.0)
-                for fd in readable:
-                    if fd is process.stdout:
-                        line = process.stdout.readline()
-                        if line and not any(char in line for char in ['|', '/', '-', '\\']):
-                            logger.info(line.strip())
-                            setup_log.write(f"STDOUT: {line}")
-                            stdout_lines.append(line)
-                    if fd is process.stderr:
-                        line = process.stderr.readline()
-                        if line:
-                            logger.error(line.strip())
-                            setup_log.write(f"STDERR: {line}")
-                            stderr_lines.append(line)
-                setup_log.flush()
-            for line in process.stdout:
-                if line and not any(char in line for char in ['|', '/', '-', '\\']):
-                    logger.info(line.strip())
-                    setup_log.write(f"STDOUT: {line}")
-                    stdout_lines.append(line)
-            for line in process.stderr:
-                if line:
-                    logger.error(line.strip())
-                    setup_log.write(f"STDERR: {line}")
-                    stderr_lines.append(line)
-            setup_log.flush()
-            return_code = process.wait(timeout=1200)
-            logger.info(f"Setup script completed with return code: {return_code}")
-            logger.info(f"Setup took {time.time() - start_time} seconds")
-            setup_log.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Setup completed with return code: {return_code}\n")
-            if return_code != 0:
-                logger.error(f"Setup failed: Last 10 stdout lines: {''.join(stdout_lines[-10:])}\nLast 10 stderr lines: {''.join(stderr_lines[-10:])}")
-                return {
-                    "status": "error",
-                    "output": "".join(stdout_lines[-10:]),
-                    "error": "".join(stderr_lines[-10:])
-                }
-
-        python_path = (
-            "/volume/micromamba/envs/env/bin/python" if use_conda else
-            "/volume/workdir/venv/bin/python"
-        )
-        if not os.path.exists(python_path):
-            logger.error(f"Environment not found at {python_path}")
-            return {
-                "status": "error",
-                "output": "".join(stdout_lines[-10:]),
-                "error": f"Environment not found at {python_path}"
-            }
-
-        if test_script:
-            logger.info("Writing test script to /volume/test.py")
-            with open("/volume/test.py", "w") as f:
-                test_lines = [line.strip() for line in test_script.split(";") if line.strip()]
-                f.write("\n".join(test_lines))
-            logger.info(f"Executing test script /volume/test.py")
-            with open(test_log_path, "a") as test_log:
-                test_log.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting test:\n")
-                cmd = (
-                    ["/volume/micromamba/micromamba", "run", "-n", "env", "python", "/volume/test.py"]
-                    if use_conda else
-                    [python_path, "/volume/test.py"]
-                )
-                process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    bufsize=1,
-                )
-                stdout_lines, stderr_lines = [], []
-                while process.poll() is None:
-                    readable, _, _ = select([process.stdout, process.stderr], [], [], 1.0)
-                    for fd in readable:
-                        if fd is process.stdout:
-                            line = process.stdout.readline()
-                            if line:
-                                logger.info(line.strip())
-                                test_log.write(f"STDOUT: {line}")
-                                stdout_lines.append(line)
-                        if fd is process.stderr:
-                            line = process.stderr.readline()
-                            if line:
-                                logger.error(line.strip())
-                                test_log.write(f"STDERR: {line}")
-                                stderr_lines.append(line)
-                    test_log.flush()
-                for line in process.stdout:
-                    if line:
-                        logger.info(line.strip())
-                        test_log.write(f"STDOUT: {line}")
-                        stdout_lines.append(line)
-                for line in process.stderr:
-                    if line:
-                        logger.error(line.strip())
-                        test_log.write(f"STDERR: {line}")
-                        stderr_lines.append(line)
-                test_log.flush()
-                return_code = process.wait(timeout=1200)
-                logger.info(f"Test script completed with return code: {return_code}")
-                test_log.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Test completed with return code: {return_code}\n")
-                if return_code != 0:
-                    logger.error(f"Test failed: Last 10 stdout lines: {''.join(stdout_lines[-10:])}\nLast 10 stderr lines: {''.join(stderr_lines[-10:])}")
-                    return {
-                        "status": "error",
-                        "output": "".join(stdout_lines[-10:]),
-                        "error": "".join(stderr_lines[-10:])
-                    }
-
-        return {
-            "status": "success",
-            "output": "".join(stdout_lines[-10:]),
-            "error": ""
-        }
-
-    except Exception as e:
-        logger.error(f"Test failed [Run ID: {run_id}]: {str(e)}")
-        try:
-            with open(setup_log_path, "a") as setup_log:
-                setup_log.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Exception: {str(e)}\n")
-        except Exception as log_error:
-            logger.error(f"Failed to write to setup log: {str(log_error)}")
-        return {"status": "error", "output": "", "error": str(e)}
-    finally:
-        try:
-            if use_conda:
-                subprocess.run(
-                    ["/volume/micromamba/micromamba", "env", "remove", "-n", "env", "--yes", "--root-prefix", "/volume/micromamba"],
-                    capture_output=True,
-                    text=True
-                )
-                logger.info(f"Removed Conda environment [Run ID: {run_id}]")
-            else:
-                subprocess.run(
-                    ["rm", "-rf", "/volume/workdir"],
-                    capture_output=True,
-                    text=True
-                )
-                logger.info(f"Removed venv environment [Run ID: {run_id}]")
-            if use_conda and os.path.exists(lock_file):
-                with open(lock_file, "w") as f:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-                logger.info(f"Released lock [Run ID: {run_id}]")
-        except Exception as cleanup_error:
-            logger.error(f"Cleanup failed [Run ID: {run_id}]: {str(cleanup_error)}")
-
-@app.function(
-    image=image_312,
-    gpu="A10",
-    volumes={"/volume": modal.Volume.from_name("claude-test-cache")},
-    timeout=1200,
-    secrets=[modal.Secret.from_name("anthropic-secret")],
-    max_containers=1
-)
-def run_test_312(commands: list, test_script: str, use_conda: bool = False):
-    run_id = uuid.uuid4().hex[:8]
-    logger.info(f"Running test [Run ID: {run_id}] with commands: {commands}, use_conda: {use_conda}")
-    setup_log_path = "/volume/setup_log.txt"
-    test_log_path = "/volume/test_log.txt"
-    app_log_path = "/volume/app_log.txt"
-    result_path = "/volume/result.json"
-    cache_dir = None
-    lock_file = "/volume/micromamba/lockfile"
-
-    try:
-        if use_conda:
-            os.makedirs(os.path.dirname(lock_file), exist_ok=True)
-            with open(lock_file, "w") as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                logger.info(f"Acquired lock [Run ID: {run_id}]")
-
-        if use_conda:
-            cache_dir = f"/volume/micromamba/cache_{run_id}"
-            os.makedirs(cache_dir, exist_ok=True)
-            os.environ["MAMBA_ROOT_PREFIX"] = "/volume/micromamba"
-            os.environ["MAMBA_CACHE_DIR"] = cache_dir
-            logger.info(f"MAMBA_ROOT_PREFIX=/volume/micromamba, MAMBA_CACHE_DIR={cache_dir}")
-
-            micromamba_check = subprocess.run(
-                ["/volume/micromamba/micromamba", "--version"],
-                capture_output=True,
-                text=True
-            )
-            logger.info(f"Micromamba version: {micromamba_check.stdout.strip()}")
-
-        for log_file in [setup_log_path, test_log_path, app_log_path, result_path]:
-            os.makedirs(os.path.dirname(log_file), exist_ok=True)
-            if not os.path.exists(log_file):
-                with open(log_file, "w") as f:
-                    f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Log file created\n")
-                logger.info(f"Created log file: {log_file}")
-
-        logger.info("Writing setup script to /volume/setup.sh")
-        with open("/volume/setup.sh", "w") as f:
-            f.write("#!/bin/bash\nset -e\n")
-            if use_conda:
-                f.write("export MAMBA_ROOT_PREFIX=/volume/micromamba\n")
-                f.write(f"export MAMBA_CACHE_DIR={cache_dir}\n")
-            f.write("\n".join(commands) + "\n")
-        os.chmod("/volume/setup.sh", 0o755)
-
-        logger.info("Executing setup script /volume/setup.sh")
-        start_time = time.time()
-        with open(setup_log_path, "a") as setup_log:
-            setup_log.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Executing setup\n")
-            process = subprocess.Popen(
-                ["/volume/setup.sh"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-            )
-            stdout_lines, stderr_lines = [], []
-            while process.poll() is None:
-                readable, _, _ = select([process.stdout, process.stderr], [], [], 1.0)
-                for fd in readable:
-                    if fd is process.stdout:
-                        line = process.stdout.readline().strip()
-                        if line and not any(char in line for char in ['|', '/', '-', '\\']):
-                            logger.info(line)
-                            stdout_lines.append(line)
-                            setup_log.write(f"STDOUT: {line}\n")
-                    if fd is process.stderr:
-                        line = process.stderr.readline().strip()
-                        if line:
-                            logger.error(line)
-                            stderr_lines.append(line)
-                            setup_log.write(f"STDERR: {line}\n")
-                setup_log.flush()
-            for line in process.stdout:
-                if line.strip() and not any(char in ['|', '/', '-', '\\'] for char in line.strip()):
-                    logger.info(line.strip())
-                    stdout_lines.append(line.strip())
-                    setup_log.write(f"STDOUT: {line}\n")
-            for line in process.stderr:
-                if line.strip():
-                    logger.error(line.strip())
-                    stderr_lines.append(line.strip())
-                    setup_log.write(f"STDERR: {line}\n")
-            setup_log.flush()
-            return_code = process.wait(timeout=1200)
-            logger.info(f"Setup script completed with return code: {return_code}")
-            logger.info(f"Setup took {time.time() - start_time} seconds")
-            setup_log.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Setup completed with return code: {return_code}\n")
-            if return_code != 0:
-                logger.error(f"Setup failed: Last 10 stdout lines: {''.join(stdout_lines[-10:])}\nLast 10 stderr lines: {''.join(stderr_lines[-10:])}")
-                return {
-                    "status": "error",
-                    "output": "".join(stdout_lines[-10:]),
-                    "error": "".join(stderr_lines[-10:])
-                }
-
-        python_path = (
-            "/volume/micromamba/envs/env/bin/python" if use_conda else
-            "/volume/workdir/venv/bin/python"
-        )
-        if not os.path.exists(python_path):
-            logger.error(f"Environment not found at {python_path}")
-            return {
-                "status": "error",
-                "output": "".join(stdout_lines[-10:]),
-                "error": f"Environment not found at {python_path}"
-            }
-
-        if test_script:
-            logger.info("Writing test script to /volume/test.py")
-            with open("/volume/test.py", "w") as f:
-                test_lines = [line.strip() for line in test_script.split(";") if line.strip()]
-                f.write("\n".join(test_lines))
-            logger.info(f"Executing test script: /volume/test.py")
-            with open(test_log_path, "a") as test_log:
-                test_log.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting test:\n")
-                cmd = (
-                    ["/volume/micromamba/micromamba", "run", "-n", "env", "python", "/volume/test.py"]
-                    if use_conda else
-                    [python_path, "/volume/test.py"]
-                )
-                process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    bufsize=1,
-                )
-                stdout_lines, stderr_lines = [], []
-                while process.poll() is None:
-                    readable, _, _ = select([process.stdout, process.stderr], [], [], 1.0)
-                    for fd in readable:
-                        if fd is process.stdout:
-                            line = process.stdout.readline().strip()
-                            if line:
-                                logger.info(line)
-                                test_log.write(f"STDOUT: {line}\n")
-                                stdout_lines.append(line)
-                        if fd is process.stderr:
-                            line = process.stderr.readline().strip()
-                            if line:
-                                logger.error(line)
-                                test_log.write(f"STDERR: {line}\n")
-                                stderr_lines.append(line)
-                    test_log.flush()
-                for line in process.stdout:
-                    if line.strip():
-                        logger.info(line.strip())
-                        test_log.write(f"STDOUT: {line}\n")
-                        stdout_lines.append(line.strip())
-                for line in process.stderr:
-                    if line.strip():
-                        logger.error(line.strip())
-                        test_log.write(f"STDERR: {line}\n")
-                        stderr_lines.append(line.strip())
-                test_log.flush()
-                return_code = process.wait(timeout=1200)
-                logger.info(f"Test script completed with return code: {return_code}")
-                test_log.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Test completed with return code: {return_code}\n")
-                if return_code != 0:
-                    logger.error(f"Test failed: Last 10 stdout lines: {''.join(stdout_lines[-10:])}\nLast 10 stderr lines: {''.join(stderr_lines[-10:])}")
-                    return {
-                        "status": "error",
-                        "output": "".join(stdout_lines[-10:]),
-                        "error": "".join(stderr_lines[-10:])
-                    }
-
-        return {
-            "status": "success",
-            "output": "".join(stdout_lines[-10:]),
-            "error": ""
-        }
-
-    except Exception as e:
-        logger.error(f"Test failed [Run ID: {run_id}]: {str(e)}")
-        try:
-            with open(setup_log_path, "a") as setup_log:
-                setup_log.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Exception: {str(e)}\n")
-        except Exception as log_error:
-            logger.error(f"Failed to write to setup log: {str(log_error)}")
-        return {"status": "error", "output": "", "error": str(e)}
-    finally:
-        try:
-            if use_conda:
-                subprocess.run(
-                    ["/volume/micromamba/micromamba", "env", "remove", "-n", "env", "--yes", "--root-prefix", "/volume/micromamba"],
-                    capture_output=True,
-                    text=True
-                )
-                logger.info(f"Removed Conda environment [Run ID: {run_id}]")
-            else:
-                subprocess.run(
-                    ["rm", "-rf", "/volume/workdir"],
-                    capture_output=True,
-                    text=True
-                )
-                logger.info(f"Removed venv environment [Run ID: {run_id}]")
-            if use_conda and os.path.exists(lock_file):
-                with open(lock_file, "w") as f:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-                logger.info(f"Released lock [Run ID: {run_id}]")
-        except Exception as cleanup_error:
-            logger.error(f"Cleanup failed [Run ID: {run_id}]: {str(cleanup_error)}")
-
-@app.function(
-    image=image_312,
-    timeout=1200,
-    volumes={"/volume": modal.Volume.from_name("claude-test-cache")},
-    secrets=[modal.Secret.from_name("anthropic-secret")]
-)
-def process_user_input_cycle4(user_input: dict, cycle_response: dict, test_result: dict, python_version: str) -> dict:
-    logger.info("Cycle 4: Generating clean bash commands")
-    use_conda = user_input.get("use_conda", False)
-    bash_commands = cycle_response.get("bash_commands", "")
-    cleaned_commands = []
-
-    if use_conda:
-        # Заменяем Micromamba на conda
-        bash_commands = bash_commands.replace("/volume/micromamba/micromamba", "conda")
-        lines = bash_commands.splitlines()
-        for line in lines:
-            if line.startswith("mkdir -p") or line.startswith("cd /volume"):
-                continue
-            if "pip install" in line:
-                pip_packages = line.split("pip install --no-cache-dir ")[-1]
-                cleaned_commands.append(f"conda activate env"
-                                        f"pip install {pip_packages}")
-            else:
-                cleaned_commands.append(line.replace(" -y", ""))
-        cleaned_commands.insert(0, f"conda create -n env python={python_version} pip -c conda-forge")
-        cleaned_commands.append("conda activate env")
-        cleaned_commands.append('echo "Environment setup complete! Activate with: conda activate env"')
-    else:
-        # Venv
-        lines = bash_commands.splitlines()
-        for line in lines:
-            if line.startswith("mkdir -p") or line.startswith("cd /volume"):
-                continue
-            if line.startswith("python"):
-                line = line.replace(f"python{python_version}", "python")
-                cleaned_commands.append(line.replace("-m venv venv", "-m venv env"))
-            else:
-                cleaned_commands.append(line.replace("--no-cache-dir ", ""))
-        cleaned_commands.insert(1, "source env/bin/activate")
-        cleaned_commands.append("Environment setup complete! Activate with: source env/bin/activate")
-
-    return {"bash_commands": "\n".join(cleaned_commands)}
-
 def install_micromamba_if_needed():
-    setup_log_path = "/volume/setup_log.txt"
     micromamba_path = "/volume/micromamba/micromamba"
     tarball_path = "/volume/micromamba/micromamba.tar.bz2"
     micromamba_dir = "/volume/micromamba"
@@ -758,15 +301,364 @@ def install_micromamba_if_needed():
                 raise RuntimeError(f"Micromamba installation failed after {max_retries} attempts: {str(e)}")
             time.sleep(retry_delay)
 
+setup_log_path = "/volume/setup_log.txt"
+test_log_path = "/volume/test_log.txt"
+result_path = "/volume/result.json"
+lock_file = "/volume/micromamba/lockfile"
+
+
+@app.function(
+    image=image_311,
+    gpu="A10",
+    volumes={"/volume": modal.Volume.from_name("claude-test-cache")},
+    timeout=3600,
+    secrets=[modal.Secret.from_name("anthropic-secret")],
+    max_containers=1
+)
+def run_test_311(commands: list, test_script: str, use_conda: bool = False):
+    run_id = uuid.uuid4().hex[:8]
+    logger.info(f"Running test [Run ID: {run_id}] with commands: {commands}, use_conda: {use_conda}")
+    cache_dir = None
+
+    try:
+        if use_conda:
+            os.makedirs(os.path.dirname(lock_file), exist_ok=True)
+            with open(lock_file, "w") as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                logger.info(f"Acquired lock [Run ID: {run_id}]")
+
+        if use_conda:
+            cache_dir = f"/volume/micromamba/cache_{run_id}"
+            os.makedirs(cache_dir, exist_ok=True)
+            os.environ["MAMBA_ROOT_PREFIX"] = "/volume/micromamba"
+            os.environ["MAMBA_CACHE_DIR"] = cache_dir
+            logger.info(f"MAMBA_ROOT_PREFIX=/volume/micromamba, MAMBA_CACHE_DIR={cache_dir}")
+            micromamba_check = subprocess.run(
+                ["/volume/micromamba/micromamba", "--version"],
+                capture_output=True,
+                text=True
+            )
+            logger.info(f"Micromamba version: {micromamba_check.stdout.strip()}")
+
+        for log_file in [setup_log_path, test_log_path, result_path]:
+            os.makedirs(os.path.dirname(log_file), exist_ok=True)
+            if not os.path.exists(log_file):
+                with open(log_file, "w") as f:
+                    f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Log file created\n")
+                logger.info(f"Created log file: {log_file}")
+
+        with open("/volume/setup.sh", "w") as f:
+            f.write("#!/bin/bash\nset -e\n")
+            if use_conda:
+                f.write("export MAMBA_ROOT_PREFIX=/volume/micromamba\n")
+                f.write(f"export MAMBA_CACHE_DIR={cache_dir}\n")
+            f.write("\n".join(commands) + "\n")
+        os.chmod("/volume/setup.sh", 0o755)
+
+        logger.info("Executing setup script /volume/setup.sh")
+        start_time = time.time()
+        with open(setup_log_path, "a") as setup_log:
+            setup_log.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Executing setup:\n")
+            result = subprocess.run(
+                ["/volume/setup.sh"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=3600
+            )
+            setup_log.write(f"STDOUT: {result.stdout}\n")
+            setup_log.write(f"STDERR: {result.stderr}\n")
+            setup_log.flush()
+            return_code = result.returncode
+            logger.info(f"Setup script completed with return code: {return_code}")
+            logger.info(f"Setup took {time.time() - start_time:.2f} seconds")
+            setup_log.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Setup completed with return code: {return_code}\n")
+            if return_code != 0:
+                logger.error(f"Setup failed: {result.stderr}")
+                return {"status": "error", "output": result.stdout[-100:], "error": result.stderr[-100:]}
+
+        python_path = "/volume/workdir/venv/bin/python" if not use_conda else "/volume/micromamba/envs/env/bin/python"
+        if not os.path.exists(python_path):
+            logger.error(f"Environment not found at {python_path}")
+            return {"status": "error", "output": "", "error": f"Environment not found at {python_path}"}
+
+        if test_script:
+            logger.info("Writing test script to /volume/test.py")
+            with open("/volume/test.py", "w") as f:
+                test_lines = [line.strip() for line in test_script.split(";") if line.strip()]
+                f.write("\n".join(test_lines))
+            logger.info(f"Executing test script: /volume/test.py")
+            with open(test_log_path, "a") as test_log:
+                test_log.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting test:\n")
+                cmd = (
+                    ["/volume/micromamba/micromamba", "run", "-n", "env", "python", "/volume/test.py"]
+                    if use_conda else
+                    [python_path, "/volume/test.py"]
+                )
+                result = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=3600
+                )
+                test_log.write(f"STDOUT: {result.stdout}\n")
+                test_log.write(f"STDERR: {result.stderr}\n")
+                test_log.flush()
+                return_code = result.returncode
+                logger.info(f"Test script completed with return code: {return_code}")
+                test_log.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Test completed with return code: {return_code}\n")
+                if return_code != 0:
+                    logger.error(f"Test failed: {result.stderr}")
+                    return {"status": "error", "output": result.stdout[-100:], "error": result.stderr[-100:]}
+
+        return {"status": "success", "output": "", "error": ""}
+
+    except Exception as e:
+        logger.error(f"Test failed [Run ID: {run_id}]: {str(e)}")
+        try:
+            with open(setup_log_path, "a") as setup_log:
+                setup_log.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Exception: {str(e)}\n")
+        except Exception as log_error:
+            logger.error(f"Failed to write to setup log: {str(log_error)}")
+        return {"status": "error", "output": "", "error": str(e)}
+    finally:
+        try:
+            if use_conda:
+                subprocess.run(
+                    ["/volume/micromamba/micromamba", "env", "remove", "-n", "env", "--yes", "--root-prefix", "/volume/micromamba"],
+                    capture_output=True,
+                    text=True
+                )
+                logger.info(f"Removed Conda environment [Run ID: {run_id}]")
+            else:
+                subprocess.run(
+                    ["rm", "-rf", "/volume/workdir"],
+                    capture_output=True,
+                    text=True
+                )
+                logger.info(f"Removed venv environment [Run ID: {run_id}]")
+            if use_conda and os.path.exists(lock_file):
+                with open(lock_file, "w") as f:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                logger.info(f"Released lock [Run ID: {run_id}]")
+        except Exception as cleanup_error:
+            logger.error(f"Cleanup failed [Run ID: {run_id}]: {str(cleanup_error)}")
+
 @app.function(
     image=image_312,
-    timeout=1200,
+    gpu="A10",
+    volumes={"/volume": modal.Volume.from_name("claude-test-cache")},
+    timeout=3600,
+    secrets=[modal.Secret.from_name("anthropic-secret")],
+    max_containers=1
+)
+def run_test_312(commands: list, test_script: str, use_conda: bool = False):
+    run_id = uuid.uuid4().hex[:8]
+    logger.info(f"Running test [Run ID: {run_id}] with commands: {commands}, use_conda: {use_conda}")
+    cache_dir = None
+
+    try:
+        if use_conda:
+            os.makedirs(os.path.dirname(lock_file), exist_ok=True)
+            with open(lock_file, "w") as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                logger.info(f"Acquired lock [Run ID: {run_id}]")
+
+        if use_conda:
+            cache_dir = f"/volume/micromamba/cache_{run_id}"
+            os.makedirs(cache_dir, exist_ok=True)
+            os.environ["MAMBA_ROOT_PREFIX"] = "/volume/micromamba"
+            os.environ["MAMBA_CACHE_DIR"] = cache_dir
+            logger.info(f"MAMBA_ROOT_PREFIX=/volume/micromamba, MAMBA_CACHE_DIR={cache_dir}")
+            micromamba_check = subprocess.run(
+                ["/volume/micromamba/micromamba", "--version"],
+                capture_output=True,
+                text=True
+            )
+            logger.info(f"Micromamba version: {micromamba_check.stdout.strip()}")
+
+        for log_file in [setup_log_path, test_log_path, result_path]:
+            os.makedirs(os.path.dirname(log_file), exist_ok=True)
+            if not os.path.exists(log_file):
+                with open(log_file, "w") as f:
+                    f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Log file created\n")
+                logger.info(f"Created log file: {log_file}")
+
+        with open("/volume/setup.sh", "w") as f:
+            f.write("#!/bin/bash\nset -e\n")
+            if use_conda:
+                f.write("export MAMBA_ROOT_PREFIX=/volume/micromamba\n")
+                f.write(f"export MAMBA_CACHE_DIR={cache_dir}\n")
+            f.write("\n".join(commands) + "\n")
+        os.chmod("/volume/setup.sh", 0o755)
+
+        logger.info("Executing setup script /volume/setup.sh")
+        start_time = time.time()
+        with open(setup_log_path, "a") as setup_log:
+            setup_log.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Executing setup:\n")
+            result = subprocess.run(
+                ["/volume/setup.sh"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=3600
+            )
+            setup_log.write(f"STDOUT: {result.stdout}\n")
+            setup_log.write(f"STDERR: {result.stderr}\n")
+            setup_log.flush()
+            return_code = result.returncode
+            logger.info(f"Setup script completed with return code: {return_code}")
+            logger.info(f"Setup took {time.time() - start_time:.2f} seconds")
+            setup_log.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Setup completed with return code: {return_code}\n")
+            if return_code != 0:
+                logger.error(f"Setup failed: {result.stderr}")
+                return {"status": "error", "output": result.stdout[-100:], "error": result.stderr[-100:]}
+
+        python_path = "/volume/workdir/venv/bin/python" if not use_conda else "/volume/micromamba/envs/env/bin/python"
+        if not os.path.exists(python_path):
+            logger.error(f"Environment not found at {python_path}")
+            return {"status": "error", "output": "", "error": f"Environment not found at {python_path}"}
+
+        if test_script:
+            logger.info("Writing test script to /volume/test.py")
+            with open("/volume/test.py", "w") as f:
+                test_lines = [line.strip() for line in test_script.split(";") if line.strip()]
+                f.write("\n".join(test_lines))
+            logger.info(f"Executing test script: /volume/test.py")
+            with open(test_log_path, "a") as test_log:
+                test_log.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting test:\n")
+                cmd = (
+                    ["/volume/micromamba/micromamba", "run", "-n", "env", "python", "/volume/test.py"]
+                    if use_conda else
+                    [python_path, "/volume/test.py"]
+                )
+                result = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=3600
+                )
+                test_log.write(f"STDOUT: {result.stdout}\n")
+                test_log.write(f"STDERR: {result.stderr}\n")
+                test_log.flush()
+                return_code = result.returncode
+                logger.info(f"Test script completed with return code: {return_code}")
+                test_log.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Test completed with return code: {return_code}\n")
+                if return_code != 0:
+                    logger.error(f"Test failed: {result.stderr}")
+                    return {"status": "error", "output": result.stdout[-100:], "error": result.stderr[-100:]}
+
+        return {"status": "success", "output": "", "error": ""}
+
+    except Exception as e:
+        logger.error(f"Test failed [Run ID: {run_id}]: {str(e)}")
+        try:
+            with open(setup_log_path, "a") as setup_log:
+                setup_log.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Exception: {str(e)}\n")
+        except Exception as log_error:
+            logger.error(f"Failed to write to setup log: {str(log_error)}")
+        return {"status": "error", "output": "", "error": str(e)}
+    finally:
+        try:
+            if use_conda:
+                subprocess.run(
+                    ["/volume/micromamba/micromamba", "env", "remove", "-n", "env", "--yes", "--root-prefix", "/volume/micromamba"],
+                    capture_output=True,
+                    text=True
+                )
+                logger.info(f"Removed Conda environment [Run ID: {run_id}]")
+            else:
+                subprocess.run(
+                    ["rm", "-rf", "/volume/workdir"],
+                    capture_output=True,
+                    text=True
+                )
+                logger.info(f"Removed venv environment [Run ID: {run_id}]")
+            if use_conda and os.path.exists(lock_file):
+                with open(lock_file, "w") as f:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                logger.info(f"Released lock [Run ID: {run_id}]")
+        except Exception as cleanup_error:
+            logger.error(f"Cleanup failed [Run ID: {run_id}]: {str(cleanup_error)}")
+
+
+async def async_generator_wrapper(generator):
+    """Convert a synchronous generator to an async iterable."""
+    for item in generator:
+        yield item
+        await asyncio.sleep(0)
+
+@app.function(
+    image=image_312,
+    timeout=3600,
+    volumes={"/volume": modal.Volume.from_name("claude-test-cache")},
+    secrets=[modal.Secret.from_name("anthropic-secret")]
+)
+async def process_user_input_cycle4(user_input: dict, cycle_response: dict, test_result: dict, python_version: str) -> dict:
+    logger.info("Cycle 4: Sending bash_commands to Claude for cleaning")
+    bash_commands = cycle_response.get("bash_commands", "")
+    if not bash_commands:
+        logger.error("No bash_commands provided in cycle_response")
+        return {
+            "response_type": "json",
+            "bash_commands": "",
+            "message": "Error: Unable to generate user-facing commands due to missing input."
+        }
+
+    query_data = {
+        "bash_commands": bash_commands,
+        "test_result": test_result,
+        "user_input": user_input,
+        "python_version": python_version
+    }
+
+    try:
+        client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=4000,
+            messages=[{"role": "user", "content": SYSTEM_PROMPT_CYCLE4 + "\n\nInput data: " + json.dumps(query_data)}]
+        )
+        raw_response = response.content[0].text.strip()
+        logger.info(f"Claude raw response: {raw_response}")
+        if not raw_response:
+            raise ValueError("Empty response from Claude")
+        claude_response = json.loads(raw_response)
+        required_keys = {"response_type", "bash_commands", "message"}
+        if not all(claude_response.get(key) for key in required_keys):
+            logger.error(f"Invalid Claude response: missing required keys {required_keys - set(claude_response.keys())}")
+            return {
+                "response_type": "json",
+                "bash_commands": bash_commands,
+                "message": "Error: Unable to generate user-facing commands."
+            }
+        logger.info(f"Cycle 4 response: {claude_response}")
+        return claude_response
+    except APIError as e:
+        logger.error(f"Claude API error: {str(e)}")
+        return {
+            "response_type": "json",
+            "bash_commands": bash_commands,
+            "message": f"Error: Claude API failed: {str(e)}."
+        }
+    except Exception as e:
+        logger.error(f"Unexpected error in Cycle 4: {str(e)}")
+        return {
+            "response_type": "json",
+            "bash_commands": bash_commands,
+            "message": f"Error: {str(e)}"
+        }
+
+@app.function(
+    image=image_312,
+    timeout=3600,
     secrets=[modal.Secret.from_name("anthropic-secret")],
     volumes={"/volume": modal.Volume.from_name("claude-test-cache")},
     max_containers=1
 )
-def process_user_input_logic(user_input: dict, python_version: str) -> str:
-    setup_log_path = "/volume/setup_log.txt"
+async def process_user_input_logic(user_input: dict, python_version: str):
     app_log_path = "/volume/app_log.txt"
     result_path = "/volume/result.json"
     run_id = uuid.uuid4().hex[:8]
@@ -780,13 +672,13 @@ def process_user_input_logic(user_input: dict, python_version: str) -> str:
                 logger.info(f"Created log file: {log_file}")
         except Exception as e:
             logger.error(f"Error creating log file {log_file}: {str(e)}")
-            return json.dumps({
-                "response_type": "json",
-                "bash_commands": "",
-                "test_script": "",
-                "reasoning_content": f"<p>Failed to create log file: {str(e)}</p>",
-                "message": f"Error creating log file {log_file}"
-            })
+            yield json.dumps({
+                "status": "done",
+                "result": json.dumps({
+                    "message": "We could not test the environment. Please try again."
+                })
+            }) + "\n"
+            return
 
     file_handler = None
     try:
@@ -796,18 +688,16 @@ def process_user_input_logic(user_input: dict, python_version: str) -> str:
         logger.addHandler(file_handler)
     except Exception as e:
         logger.error(f"Error setting up file handler for {app_log_path}: {str(e)}")
-        return json.dumps({
-            "response_type": "json",
-            "bash_commands": "",
-            "test_script": "",
-            "reasoning_content": f"<p>Error setting up file handler: {str(e)}</p>",
-            "message": f"Error setting up file handler for {app_log_path}"
-        })
+        yield json.dumps({
+            "status": "done",
+            "result": json.dumps({
+                "message": "We could not test the environment. Please try again."
+            })
+        }) + "\n"
+        return
 
     try:
-        from anthropic import Anthropic, APIError
         client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-
         use_conda = user_input.get("use_conda", False)
         if use_conda:
             install_micromamba_if_needed()
@@ -815,13 +705,13 @@ def process_user_input_logic(user_input: dict, python_version: str) -> str:
 
         query = user_input.get("query", "").lower().strip()
         if not query:
-            return json.dumps({
-                "response_type": "json",
-                "bash_commands": "",
-                "test_script": "",
-                "reasoning_content": "<p>Error: No query provided</p>",
-                "message": "Error: Please provide a query"
-            })
+            yield json.dumps({
+                "status": "done",
+                "result": json.dumps({
+                    "message": "We could not test the environment. Please try again."
+                })
+            }) + "\n"
+            return
 
         full_query = {
             "query": query,
@@ -842,22 +732,29 @@ def process_user_input_logic(user_input: dict, python_version: str) -> str:
             cleaned_lines = [line for line in lines if "export DEBIAN_FRONTEND=noninteractive" not in line]
             return "\n".join(cleaned_lines)
 
+        start_time = time.time()
+        last_keepalive = start_time
+
         while attempt <= max_attempts:
+            current_time = time.time()
+            if current_time - last_keepalive >= 60:
+                yield json.dumps({
+                    "status": "working",
+                    "message": "Relax, have some tea, we're doing our thing"
+                }) + "\n"
+                last_keepalive = current_time
+                await asyncio.sleep(0.1)
+
             logger.info(f"Attempt {attempt} of {max_attempts} [Run ID: {run_id}]")
 
-            # Cycle 1: Generate bash commands and test script
             if not cycle1_response:
                 logger.info("Cycle 1: Generating bash commands and test script")
+                cycle_start = time.time()
                 try:
                     response = client.messages.create(
                         model="claude-sonnet-4-20250514",
                         max_tokens=4000,
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": SYSTEM_PROMPT_CYCLE1 + "\n\nUser input: " + json.dumps(full_query)
-                            }
-                        ]
+                        messages=[{"role": "user", "content": SYSTEM_PROMPT_CYCLE1 + "\n\nUser input: " + json.dumps(full_query)}]
                     )
                     raw_response = response.content[0].text.strip()
                     logger.info(f"Cycle 1 raw response: {raw_response}")
@@ -867,34 +764,34 @@ def process_user_input_logic(user_input: dict, python_version: str) -> str:
                     cycle1_response["bash_commands"] = clean_bash_commands(cycle1_response["bash_commands"])
                     logger.info(f"Cycle 1 parsed response: {json.dumps(cycle1_response)}")
                     with open(result_path, "a") as result_file:
-                        result_file.write(
-                            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Cycle 1 response: {json.dumps(cycle1_response)}\n")
+                        result_file.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Cycle 1 response: {json.dumps(cycle1_response)}\n")
                     if cycle1_response.get("message") == "Please, specify your request":
-                        return json.dumps(cycle1_response)
+                        yield json.dumps({
+                            "status": "done",
+                            "result": json.dumps({
+                                "message": cycle1_response.get("message", "We could not test the environment. Please try again.")
+                            })
+                        }) + "\n"
+                        return
                 except (APIError, ValueError, json.JSONDecodeError) as e:
                     logger.error(f"Cycle 1 failed: {str(e)}")
-                    return json.dumps({
-                        "response_type": "json",
-                        "bash_commands": "",
-                        "test_script": "",
-                        "reasoning_content": f"<p>Cycle 1 failed: {str(e)}</p>",
-                        "message": "Error processing request"
-                    })
+                    yield json.dumps({
+                        "status": "done",
+                        "result": json.dumps({
+                            "message": "We could not test the environment. Please try again."
+                        })
+                    }) + "\n"
+                    return
+                logger.info(f"Cycle 1 took {time.time() - cycle_start:.2f} seconds")
 
-            # Cycle 2: Execute installation
             if not cycle2_response:
-                logger.info("Testing installation")
+                logger.info("Cycle 2: Generating bash commands for execution")
+                cycle_start = time.time()
                 try:
                     response = client.messages.create(
                         model="claude-sonnet-4-20250514",
                         max_tokens=4000,
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": SYSTEM_PROMPT_CYCLE2 + "\n\nCycle 1 response: " + json.dumps(
-                                    cycle1_response) + "\n\nUser input: " + json.dumps(full_query)
-                            }
-                        ]
+                        messages=[{"role": "user", "content": SYSTEM_PROMPT_CYCLE2 + "\n\nCycle 1 response: " + json.dumps(cycle1_response) + "\n\nUser input: " + json.dumps(full_query)}]
                     )
                     raw_response = response.content[0].text.strip()
                     logger.info(f"Cycle 2 raw_response: {raw_response}")
@@ -904,123 +801,134 @@ def process_user_input_logic(user_input: dict, python_version: str) -> str:
                     cycle2_response["bash_commands"] = clean_bash_commands(cycle2_response["bash_commands"])
                     logger.info(f"Cycle 2 parsed response: {json.dumps(cycle2_response)}")
                     with open(result_path, "a") as result_file:
-                        result_file.write(
-                            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Cycle 2 response: {json.dumps(cycle2_response)}\n")
-                except (APIError, ValueError, json.JSONDecodeError) as e:
+                        result_file.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Cycle 2 response: {json.dumps(cycle2_response)}\n")
+                except Exception as e:
                     logger.error(f"Cycle 2 failed: {str(e)}")
-                    return json.dumps({
-                        "response_type": "json",
-                        "bash_commands": "",
-                        "test_script": "",
-                        "reasoning_content": f"<p>Cycle 2 failed: {str(e)}</p>",
-                        "message": "Error validating environment"
-                    })
+                    yield json.dumps({
+                        "status": "done",
+                        "result": json.dumps({
+                            "message": "We could not test the environment. Please try again."
+                        })
+                    }) + "\n"
+                    return
+                logger.info(f"Cycle 2 took {time.time() - cycle_start:.2f} seconds")
 
-            # Run test
             try:
+                yield json.dumps({
+                    "status": "working",
+                    "message": "Relax, have some tea, we're doing our thing"
+                }) + "\n"
+                await asyncio.sleep(0.1)
                 run_test_func = run_test_311 if python_version == "3.11" else run_test_312
                 logger.info(
-                    f"Running test [Run ID: {run_id}] with commands: {cycle2_response['bash_commands'].splitlines()}, use_conda: {use_conda}")
-                test_result = run_test_func.remote(
-                    cycle2_response["bash_commands"].splitlines(),
+                    f"Running test [Run ID: {run_id}] with commands: {cycle2_response['bash_commands'].splitlines()}")
+                cycle_start = time.time()
+                test_result = await run_test_func.remote.aio(
+                    cycle2_response["bash_commands"].strip().splitlines(),
                     cycle2_response["test_script"],
                     use_conda
                 )
-                logger.info(f"Test result [Run ID: {run_id}]: {json.dumps(test_result)}")
-                if not test_result or "status" not in test_result:
-                    test_result = {"status": "error", "output": "", "error": "Invalid test result"}
+                logger.info(f"Test completed [Run ID: {run_id}] with status: {test_result.get('status')}")
 
-                # Check logs for 'timeout'
-                for log_file in ["/volume/setup_log.txt", "/volume/test_log.txt"]:
-                    try:
-                        with open(log_file, "r") as f:
-                            content = f.read().lower()
-                            if "timeout" in content:
-                                logger.error(f"Found 'timeout' in log file {log_file}")
-                                with open(result_path, "a") as result_file:
-                                    result_file.write(
-                                        f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Timeout detected in {log_file}\n")
-                                return json.dumps({
-                                    "response_type": "json",
-                                    "bash_commands": "",
-                                    "comments": "<p>Environment setup timed out during testing.</p>",
-                                    "message": "We could not test the environment. Please specify and limit your request."
-                                })
-                    except (FileNotFoundError, IOError) as log_error:
-                        logger.error(f"Failed to read log file {log_file}: {str(log_error)}")
-
-                if test_result.get("status") == "success":
-                    logger.info(f"Running Cycle 4 for user-facing output [Run ID: {run_id}]")
-                    try:
-                        cycle4_response = process_user_input_cycle4.remote(user_input, cycle2_response, test_result,
-                                                                           python_version)
-                        return json.dumps({"bash_commands": cycle4_response["bash_commands"]})
-                    except (subprocess.TimeoutExpired, Exception) as e:
-                        logger.error(f"Cycle 4 failed: {str(e)}")
-                        with open(result_path, "a") as result_file:
-                            result_file.write(
-                                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Cycle 4 failed: {str(e)}\n")
-                        return json.dumps({
-                            "response_type": "json",
-                            "bash_commands": "",
-                            "comments": "<p>Environment setup timed out during testing.</p>",
-                            "message": "We could not test the environment. Please specify and limit your request."
-                        })
-                time.sleep(3)
-            except (subprocess.TimeoutExpired, Exception) as e:
-                logger.error(f"Test execution failed [Run ID: {run_id}]: {str(e)}")
-                with open(result_path, "a") as result_file:
-                    result_file.write(
-                        f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Test execution failed: {str(e)}\n")
-                return json.dumps({
-                    "response_type": "json",
-                    "bash_commands": "",
-                    "comments": "<p>Environment setup timed out during testing.</p>",
-                    "message": "We could not test the environment. Please specify and limit your request."
-                })
-            attempt += 1
-
-            # Cycle 3: Fix compatibility issues
-            if test_result.get("status") == "error" and attempt <= max_attempts:
-                logger.info("Cycle 3: Fixing compatibility issues")
+                # Всегда запускаем Cycle 3 для анализа
+                with open(test_log_path, "r") as test_log:
+                    test_logs = test_log.read()
+                logger.info("Cycle 3: Analyzing compatibility issues")
+                cycle_start = time.time()
                 try:
                     response = client.messages.create(
                         model="claude-sonnet-4-20250514",
                         max_tokens=4000,
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": SYSTEM_PROMPT_CYCLE3 + "\n\nUser input: " + json.dumps(
-                                    full_query) + "\n\nCycle 2 response: " + json.dumps(
-                                    cycle2_response) + "\n\nTest result: " + json.dumps(test_result)
-                            }
-                        ]
+                        messages=[{"role": "user", "content": SYSTEM_PROMPT_CYCLE3 + "\n\nUser input: " + json.dumps(
+                            full_query) + "\n\nCycle 2 response: " + json.dumps(
+                            cycle2_response) + "\n\nTest result: " + json.dumps(
+                            test_result) + "\n\nTest logs: " + test_logs}]
                     )
                     raw_response = response.content[0].text.strip()
                     logger.info(f"Cycle 3 raw response: {raw_response}")
                     if not raw_response:
                         raise ValueError("Empty response from Claude")
-                    cycle2_response = extract_json(raw_response)
-                    cycle2_response["bash_commands"] = clean_bash_commands(cycle2_response["bash_commands"])
-                    logger.info(f"Cycle 3 parsed response: {json.dumps(cycle2_response)}")
+                    cycle3_response = extract_json(raw_response)
+                    cycle3_response["bash_commands"] = clean_bash_commands(cycle3_response["bash_commands"])
+                    logger.info(f"Cycle 3 parsed response: {cycle3_response}")
                     with open(result_path, "a") as result_file:
                         result_file.write(
-                            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Cycle 3 response: {json.dumps(cycle2_response)}\n")
-                    continue
+                            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Cycle 3 response: {json.dumps(cycle3_response)}\n")
+                    logger.info(f"Cycle 3 took {time.time() - cycle_start:.2f} seconds")
+
+                    # Проверяем решение Cycle 3
+                    if cycle3_response.get("status") == "error" and attempt < max_attempts:
+                        logger.info("Cycle 3 detected issues, updating test result and returning to Cycle 2")
+                        test_result = {"status": "error", "output": "",
+                                       "error": cycle3_response.get("message", "Compatibility issues detected")}
+                        cycle2_response["bash_commands"] = cycle3_response["bash_commands"]
+                        cycle2_response["test_script"] = cycle3_response.get("test_script",
+                                                                            cycle2_response["test_script"])
+                        continue  # Возвращаемся на Cycle 2 для повторного теста
+                    else:
+                        logger.info("Cycle 3 confirmed compatibility, proceeding to Cycle 4")
+                        # Оставляем test_result как есть (обычно "success") и переходим к Cycle 4
                 except (APIError, ValueError, json.JSONDecodeError) as e:
                     logger.error(f"Cycle 3 failed: {str(e)}")
                     with open(result_path, "a") as result_file:
                         result_file.write(
                             f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Cycle 3 failed: {str(e)}\n")
-                    return json.dumps({
-                        "response_type": "json",
-                        "bash_commands": "",
-                        "test_script": "",
-                        "reasoning_content": f"<p>Cycle 3: {str(e)}</p>",
-                        "message": f"Error fixing compatibility: {str(e)}"
-                    })
+                    yield json.dumps({
+                        "status": "done",
+                        "result": json.dumps({
+                            "message": "We could not test the environment. Please try again."
+                        })
+                    }) + "\n"
+                    return
 
-        return json.dumps(cycle2_response)
+                # Переход к Cycle 4 после успешного анализа
+                logger.info(f"Running Cycle 4 for user-facing output [Run ID: {run_id}]")
+                cycle_start = time.time()
+                try:
+                    cycle4_response = await process_user_input_cycle4.remote.aio(user_input, cycle2_response,
+                                                                                test_result, python_version)
+                    logger.info(f"Cycle 4 took {time.time() - cycle_start:.2f} seconds")
+                    yield json.dumps({
+                        "status": "done",
+                        "result": json.dumps({
+                            "message": cycle4_response.get("message",
+                                                          "We could not test the environment. Please try again.")
+                        })
+                    }) + "\n"
+                    return
+                except Exception as e:
+                    logger.error(f"Cycle 4 failed: {str(e)}")
+                    with open(result_path, "a") as result_file:
+                        result_file.write(
+                            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Cycle 4 failed: {str(e)}\n")
+                    yield json.dumps({
+                        "status": "done",
+                        "result": json.dumps({
+                            "message": "We could not test the environment. Please try again."
+                        })
+                    }) + "\n"
+                    return
+            except Exception as e:
+                logger.error(f"Test execution failed [Run ID: {run_id}]: {str(e)}")
+                with open(result_path, "a") as result_file:
+                    result_file.write(
+                        f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Test execution failed: {str(e)}\n")
+                yield json.dumps({
+                    "status": "done",
+                    "result": json.dumps({
+                        "message": "We could not test the environment. Please try again."
+                    })
+                }) + "\n"
+                return
+
+            attempt += 1
+
+        yield json.dumps({
+            "status": "done",
+            "result": json.dumps({
+                "message": "We could not test the environment. Please try again."
+            })
+        }) + "\n"
 
     finally:
         if file_handler:
@@ -1029,32 +937,60 @@ def process_user_input_logic(user_input: dict, python_version: str) -> str:
 
 @app.function(
     image=image_311,
-    timeout=1200,
+    timeout=7200,
     volumes={"/volume": modal.Volume.from_name("claude-test-cache")},
-    secrets=[modal.Secret.from_dict({"ANTHROPIC_API_KEY": os.environ.get("ANTHROPIC_API_KEY")})],
-    max_containers=3
+    secrets=[modal.Secret.from_dict({"ANTHROPIC_API_KEY": os.getenv("ANTHROPIC_API_KEY")})],
+    max_containers=1
 )
-def process_user_input_311(user_input: dict) -> str:
-    return process_user_input_logic.remote(user_input, "3.11")
+async def process_user_input_311(user_input: dict):
+    gen = process_user_input_logic.remote_gen(user_input, "3.11")
+    async for result in async_generator_wrapper(gen):
+        yield result
 
 @app.function(
     image=image_312,
-    timeout=3600,
+    timeout=7200,
     volumes={"/volume": modal.Volume.from_name("claude-test-cache")},
-    secrets=[modal.Secret.from_dict({"ANTHROPIC_API_KEY": os.environ.get("ANTHROPIC_API_KEY")})],
-    max_containers=3
+    secrets=[modal.Secret.from_dict({"ANTHROPIC_API_KEY": os.getenv("ANTHROPIC_API_KEY")})],
+    max_containers=1
 )
-def process_user_input_312(user_input: dict) -> str:
-    return process_user_input_logic.remote(user_input, "3.12")
+async def process_user_input_312(user_input: dict):
+    gen = process_user_input_logic.remote_gen(user_input, "3.12")
+    async for result in async_generator_wrapper(gen):
+        yield result
 
-
-@app.function(image=image_311)
+@app.function(
+    image=image_311,
+    timeout=7200,
+    min_containers=0,
+    max_containers=2,
+    secrets=[modal.Secret.from_name("anthropic-secret")]
+)
 @modal.fastapi_endpoint(method="POST", label="main-endpoint")
-def main(user_input: dict):
+async def main(user_input: dict):
+    start_time = time.time()
     run_id = uuid.uuid4().hex[:8]
     logger.info(f"Main function started [Run ID: {run_id}] with input: {user_input}")
-    python_version = user_input.get("python_version", "3.11")
-    process_func = process_user_input_311 if python_version == "3.11" else process_user_input_312
-    result = process_func.remote(user_input)
-    logger.info(f"Main function result [Run ID: {run_id}]: {result}")
-    return {"result": result}
+
+    async def stream_response():
+        try:
+            python_version = user_input.get("python_version", "3.11")
+            process_func = process_user_input_311 if python_version == "3.11" else process_user_input_312
+            gen = process_func.remote_gen(user_input)
+            async for data in async_generator_wrapper(gen):
+                yield data
+            elapsed_time = time.time() - start_time
+            logger.info(f"Main function completed in {elapsed_time:.2f} seconds [Run ID: {run_id}]")
+        except Exception as e:
+            elapsed_time = time.time() - start_time
+            logger.error(f"Main function failed after {elapsed_time:.2f} seconds [Run ID: {run_id}]: {str(e)}")
+            yield json.dumps({
+                "status": "done",
+                "result": json.dumps({
+                    "response_type": "error",
+                    "bash_commands": "",
+                    "message": f"Error: {str(e)}"
+                })
+            }) + "\n"
+
+    return StreamingResponse(stream_response(), media_type="application/json")
