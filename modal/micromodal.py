@@ -172,6 +172,7 @@ The response must be valid JSON without any surrounding text.
   2. Generate user-friendly commands for the 'message' field, formatted as in the examples below, replacing {{python_version}} with the user-specified python_version (e.g., 3.12), {{python_version_no_dots}} with Python version without dots (e.g., 312), and {{cuda_version_no_dots}} with CUDA version without dots (e.g., 121 for 12.1).
   3. Ensure 'message' contains commands in the exact format of the examples, including comments (e.g., `# Create and activate environment`).
   For example:
+  
     For use_conda=True:
     
     # Create and activate environment
@@ -182,7 +183,16 @@ The response must be valid JSON without any surrounding text.
     conda install -y requests=2.32.3 flask=3.0.3 fastapi=0.115.0 httpx=0.27.2 pydantic=2.9.2 click=8.1.7 rich=13.8.1 typer=0.12.5 -c conda-forge -c defaults --no-channel-priority
     
     Environment setup complete!
+    
+    # If installation fails, try adjusting channel settings
+    conda config --remove-key channels
+    conda config --add channels conda-forge
+    conda config --add channels defaults
+    conda clean --all -y
+    conda install -y requests=2.32.3 flask=3.0.3 fastapi=0.115.0 httpx=0.27.2 pydantic=2.9.2 click=8.1.7 rich=13.8.1 typer=0.12.5 --override-channels -c conda-forge
+    
     For use_conda=False:
+    
       # Create and activate virtual environment
       python -m venv webdev_env
       source webdev_env/bin/activate
@@ -713,13 +723,16 @@ async def process_user_input_logic(user_input: dict, python_version: str):
             }) + "\n"
             return
 
-        full_query = {
-            "query": query,
-            "use_conda": use_conda,
-            "use_gpu": user_input.get("use_gpu", False),
-            "version_preference": user_input.get("version_preference", "stable"),
-            "python_version": python_version
-        }
+        try:
+            full_query = {
+                "query": query,
+                "use_conda": use_conda,
+                "use_gpu": use_gpu,
+                "version_preference": version_preference,
+                "python_version": python_version
+            }
+        except NameError as e:
+            raise ValueError(f"Undefined variable: {e}")
 
         max_attempts = 3
         attempt = 1
