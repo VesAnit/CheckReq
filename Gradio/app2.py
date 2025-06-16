@@ -41,7 +41,7 @@ def process_input(config_type, conda_choice, gpu_choice, python_version, state=N
     return "Got it, please enter your request below.", state
 
 
-def handle_query(query, state=None):
+def handle_query(query, state=None, progress=gr.Progress()):
     if state is None:
         state = {}
     logger.debug(f"Handling query: {query}")
@@ -72,19 +72,19 @@ def handle_query(query, state=None):
                 stream=True  # Enable streaming
         ) as response:
             response.raise_for_status()
-            output = "Relax, have some tea, we're doing our thing"
+            progress(0, desc="Starting request...")
             for line in response.iter_lines():
                 if line:
                     data = json.loads(line.decode('utf-8'))
                     if data.get("status") == "working":
-                        output = "Relax, have some tea, we're doing our thing"
-                        yield output, state  # Yield to update gr.Textbox
+                        message = data.get("message", "Relax, have some tea, we're doing our thing")
+                        yield message, state
                     elif data.get("status") == "done":
                         result_data = json.loads(data["result"])
                         message = result_data.get("message", "Error: No message provided in response.")
                         elapsed_time = time.time() - start_time
                         logger.info(f"Query completed in {elapsed_time:.2f} seconds")
-                        yield message, state  # Final result
+                        yield message, state
                         break
 
     except requests.Timeout as e:
@@ -160,13 +160,22 @@ def create_gradio_interface():
         output = gr.Textbox(label="Result")
 
         gr.Markdown("""
-        Enter your environment build request, for example:
+        **Enter your environment build request, for example:**
+        
         - "I need an environment for machine learning with CUDA 12.4"
+        
         - "I already have flask version 2.3.2 installed, need to complete the environment for web apps"
 
-        **Note**: If you select "Packages for GPU?", specify your CUDA version in the request (e.g., "CUDA 12.4").
-        To check your CUDA version, run in terminal: 
+        **Note**: 
+        
+        - If you select "Packages for GPU?", specify your CUDA version in the request (e.g., "CUDA 12.4").
+        
+        - To check your CUDA version, run in terminal: 
+        
         nvidia-smi
+        
+        - Conda environments are more resource-intensive and may take up to 20 minutes to test.
+        
         """)
 
         query_input = gr.Textbox(label="Your Environment Query", placeholder="Enter your request here...")
@@ -184,7 +193,7 @@ def create_gradio_interface():
             inputs=[query_input, state],
             outputs=[query_output, state],
             queue=True,
-            concurrency_limit=1  # Limit concurrency for streaming
+            concurrency_limit=1
         )
 
         demo.queue(max_size=10)
