@@ -153,7 +153,7 @@ The response must be valid JSON without any surrounding text.
      - Assume the user has conda installed if use_conda=True, or Python installed if use_conda=False.
      - If use_conda=True, use `conda` commands (e.g., `conda create`, `conda install`, `conda activate`). Do NOT include commands to install Micromamba or other package managers. Use the same channels (e.g., conda-forge, defaults) and package versions as in Cycle 2/3.
      - If use_conda=False, use `python -m venv` for a virtual environment, followed by `pip install` and activation steps (e.g., `source env/bin/activate`).
-     - If use_gpu=True, include GPU-specific packages (e.g., `pytorch` with `--extra-index-url https://download.pytorch.org/whl/cu121`) only if allowed by Cycle 2/3. Note in comments that CUDA drivers must be installed manually.
+     - If use_gpu=True, include GPU-specific packages (e.g., `pytorch` with `--extra-index-url https://download.pytorch.org/whl/cu121`) only if allowed by Cycle 2/3. - Include appropriate `cudatoolkit' package in conda install commands to ensure CUDA support, unless explicitly excluded in Cycle 2/3. Note in message that CUDA drivers and CUDA toolkit must be installed manually from here: https://developer.nvidia.com/cuda-downloads?target_os=Linux.
      - If any packages were installed via pip instead of conda, explain in comments why (e.g., not available in conda channels).
      - Include environment activation steps (e.g., `conda activate env` or `source env/bin/activate`).
      - Format commands with comments (e.g., `# Create and activate environment`) as shown in the examples below, and place them in the 'message' field.
@@ -182,14 +182,14 @@ The response must be valid JSON without any surrounding text.
     # Install packages
     conda install -y requests=2.32.3 flask=3.0.3 fastapi=0.115.0 httpx=0.27.2 pydantic=2.9.2 click=8.1.7 rich=13.8.1 typer=0.12.5 -c conda-forge -c defaults --no-channel-priority
     
-    Environment setup complete!
-    
     # If installation fails, try adjusting channel settings
     conda config --remove-key channels
     conda config --add channels conda-forge
     conda config --add channels defaults
     conda clean --all -y
     conda install -y requests=2.32.3 flask=3.0.3 fastapi=0.115.0 httpx=0.27.2 pydantic=2.9.2 click=8.1.7 rich=13.8.1 typer=0.12.5 --override-channels -c conda-forge
+    
+    Environment setup complete!
     
     For use_conda=False:
     
