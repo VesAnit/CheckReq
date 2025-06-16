@@ -153,7 +153,7 @@ The response must be valid JSON without any surrounding text.
      - Assume the user has conda installed if use_conda=True, or Python installed if use_conda=False.
      - If use_conda=True, use `conda` commands (e.g., `conda create`, `conda install`, `conda activate`). Do NOT include commands to install Micromamba or other package managers. Use the same channels (e.g., conda-forge, defaults) and package versions as in Cycle 2/3.
      - If use_conda=False, use `python -m venv` for a virtual environment, followed by `pip install` and activation steps (e.g., `source env/bin/activate`).
-     - If use_gpu=True, include GPU-specific packages (e.g., `pytorch` with `--extra-index-url https://download.pytorch.org/whl/cu121`) only if allowed by Cycle 2/3. - Include appropriate `cudatoolkit' package in conda install commands to ensure CUDA support, unless explicitly excluded in Cycle 2/3. Note in message that CUDA drivers and CUDA toolkit must be installed manually from here: https://developer.nvidia.com/cuda-downloads?target_os=Linux.
+     - If use_gpu=True, include GPU-specific packages (e.g., `pytorch` with `--extra-index-url https://download.pytorch.org/whl/cu121`) only if allowed by Cycle 2/3. Include appropriate `cudatoolkit' package in conda install commands to ensure CUDA support. Note in message that CUDA drivers and CUDA toolkit must be installed manually from here: https://developer.nvidia.com/cuda-downloads?target_os=Linux (put this link in message).
      - If any packages were installed via pip instead of conda, explain in comments why (e.g., not available in conda channels).
      - Include environment activation steps (e.g., `conda activate env` or `source env/bin/activate`).
      - Format commands with comments (e.g., `# Create and activate environment`) as shown in the examples below, and place them in the 'message' field.
@@ -668,7 +668,7 @@ async def process_user_input_cycle4(user_input: dict, cycle_response: dict, test
     volumes={"/volume": modal.Volume.from_name("claude-test-cache")},
     max_containers=1
 )
-async def process_user_input_logic(user_input: dict, python_version: str):
+async def process_user_input_logic(user_input: dict):
     app_log_path = "/volume/app_log.txt"
     result_path = "/volume/result.json"
     run_id = uuid.uuid4().hex[:8]
@@ -708,12 +708,19 @@ async def process_user_input_logic(user_input: dict, python_version: str):
 
     try:
         client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-        use_conda = user_input.get("use_conda", False)
+        if not client:
+            raise ValueError("Failed to initialize Anthropic client due to missing API key")
+
+        query = user_input["query"].lower().strip()
+        use_conda = user_input["use_conda"]
+        use_gpu = user_input["use_gpu"]
+        version_preference = user_input["version_preference"]
+        python_version = user_input["python_version"]
+
         if use_conda:
             install_micromamba_if_needed()
             os.environ["PATH"] = f"/volume/micromamba:{os.environ['PATH']}"
 
-        query = user_input.get("query", "").lower().strip()
         if not query:
             yield json.dumps({
                 "status": "done",
@@ -731,8 +738,8 @@ async def process_user_input_logic(user_input: dict, python_version: str):
                 "version_preference": version_preference,
                 "python_version": python_version
             }
-        except NameError as e:
-            raise ValueError(f"Undefined variable: {e}")
+        except KeyError as e:
+            raise ValueError(f"Missing required input parameter: {e}")
 
         max_attempts = 3
         attempt = 1
@@ -956,7 +963,7 @@ async def process_user_input_logic(user_input: dict, python_version: str):
     max_containers=1
 )
 async def process_user_input_311(user_input: dict):
-    gen = process_user_input_logic.remote_gen(user_input, "3.11")
+    gen = process_user_input_logic.remote_gen(user_input)  # Убрали python_version
     async for result in async_generator_wrapper(gen):
         yield result
 
@@ -968,7 +975,7 @@ async def process_user_input_311(user_input: dict):
     max_containers=1
 )
 async def process_user_input_312(user_input: dict):
-    gen = process_user_input_logic.remote_gen(user_input, "3.12")
+    gen = process_user_input_logic.remote_gen(user_input)  # Убрали python_version
     async for result in async_generator_wrapper(gen):
         yield result
 
@@ -987,8 +994,7 @@ async def main(user_input: dict):
 
     async def stream_response():
         try:
-            python_version = user_input.get("python_version", "3.11")
-            process_func = process_user_input_311 if python_version == "3.11" else process_user_input_312
+            process_func = process_user_input_311 if user_input.get("python_version", "3.11") == "3.11" else process_user_input_312
             gen = process_func.remote_gen(user_input)
             async for data in async_generator_wrapper(gen):
                 yield data
